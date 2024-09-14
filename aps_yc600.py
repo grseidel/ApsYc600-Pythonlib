@@ -8,6 +8,7 @@ Based on work from:
 I'm trying to keep this compatible with micropython for ESP32 & python3-serial
 '''
 import time
+import datetime
 
 class ApsYc600:
     '''
@@ -39,10 +40,10 @@ class ApsYc600:
 
         # Try and test the reader for 'in_waiting' function
         if 'in_waiting' in dir(self.reader):
-            print('Found python3-serial module')
+            print(str(datetime.datetime.now().replace(microsecond=0)) + ' Found python3-serial module')
             self.system_type = 'python3-serial'
         else:
-            print('Only using read/write (micropython)')
+            print(str(datetime.datetime.now().replace(microsecond=0)) + ' Only using read/write (micropython)')
             self.system_type = 'micropython'
 
     @staticmethod
@@ -72,7 +73,7 @@ class ApsYc600:
             # Calculate crc
             crc_res = crc_res ^ int(new_byte, 0)
         # Return as hex value
-        return hex(crc_res)
+        return "0x{:02x}".format(crc_res) #GES repair for single digit hex
 
     def __crc_check(self, in_str):
         '''
@@ -105,6 +106,7 @@ class ApsYc600:
             cmdlen = '0'+str(cmdlen)
         # Assemble and add CRC
         cmd = prefix_cmd + cmdlen  + cmd + str(self.__crc(cmdlen+cmd))[2:]
+#        print(str(datetime.datetime.now().replace(microsecond=0)) + ' CMD: ' + cmd)
         # Send each set of two characters as byte
         for i in range(0, len(cmd), 2):
             new_char = int('0x'+cmd[i]+cmd[i+1], 0).to_bytes(1, 'big')
@@ -153,9 +155,10 @@ class ApsYc600:
                 if len(temp_char) == 1:
                     temp_char = '0'+temp_char
                 out_str += temp_char
+#        print(str(datetime.datetime.now().replace(microsecond=0)) + ' RSP: ' + out_str)
         return out_str
 
-    def __decode(self, in_str):
+    def __decode(self, in_str, panels):
         '''
         Decode message type, start decoding of received information
         Called by: parse
@@ -170,10 +173,12 @@ class ApsYc600:
             '4081': 'StartupRadio',
             '4100': 'SYS_RESET_REQ',
             '4180': 'SYS_RESET_INT',
+            '4480': 'NoRoute',               #GES receive response from your radio device, but still no data is received from the inverter
             '4481': 'AF_INCOMING_MSG',
             '6101': 'ZigbeePingResp',
             '6400': 'AF_REG_Resp',
             '6401': 'AF_DATA_REQ_Resp',
+            '6402': 'SuccessfullySent',         #GES FE0164020067 is one of those standard ZNP responses. It means message is succesfully sent.
             '6605': 'ZB_WR_CONF_Resp',
             '6700': 'StartCoordinatorResp'}
 
@@ -200,44 +205,71 @@ class ApsYc600:
             else:
                 if not pair:
                     # Decode inverter poll response
-                    data = self.__decode_inverter_values(in_str)
+                    data = self.__decode_inverter_values(in_str, panels)
         return {'cmd': cmd_code, 'crc': crc, 'data': data}
 
     @staticmethod
-    def __decode_inverter_values(in_str):
+    def __decode_inverter_values(in_str, panels):
         '''
         Transform byte string of poll response to values
         called by: __decode
         '''
         # We do not need the first 38 bytes apparently
         data = in_str[38:]
-
         invtemp = -258.7 + (int('0x' + data[24:28], 0) * 0.2752) # Inverter temperature
         freq_ac = 50000000 / int('0x' + data[28:34], 0) # AC Fequency
-        # DC Current for panel 1
-        currdc1 = (int('0x'+data[48:50], 0) + (int('0x'+data[51], 0) * 256)) * (27.5 / 4096)
-        # DC Volts for panel 1
-        voltdc1 = (int('0x'+data[52:54], 0) * 16 + int('0x'+data[50], 0)) * (82.5 / 4096)
-        currdc2 = (int('0x'+data[54:56], 0) + (int('0x'+data[57], 0) * 256)) * (27.5 / 4096)
-        voltdc2 = (int('0x'+data[58:60], 0) * 16 + int('0x'+data[56], 0)) * (82.5 / 4096)
+        # DC Current & Voltd for panel 1 => order according to kadsol et. al.
+        currdc1 = (int('0x'+data[54:56], 0) + (int('0x'+data[57], 0) * 256)) * (27.5 / 4096)
+        voltdc1 = (int('0x'+data[58:60], 0) * 16 + int('0x'+data[56], 0)) * (82.5 / 4096)
+        currdc2 = (int('0x'+data[48:50], 0) + (int('0x'+data[51], 0) * 256)) * (27.5 / 4096)
+        voltdc2 = (int('0x'+data[52:54], 0) * 16 + int('0x'+data[50], 0)) * (82.5 / 4096)
+        currdc3 = (int('0x'+data[42:44], 0) + (int('0x'+data[45], 0) * 256)) * (27.5 / 4096)
+        voltdc3 = (int('0x'+data[46:48], 0) * 16 + int('0x'+data[44], 0)) * (82.5 / 4096)
+        currdc4 = (int('0x'+data[36:38], 0) + (int('0x'+data[39], 0) * 256)) * (27.5 / 4096)
+        voltdc4 = (int('0x'+data[40:42], 0) * 16 + int('0x'+data[38], 0)) * (82.5 / 4096)
         volt_ac = (int('0x'+ data[60:64], 0) * (1 / 1.3277)) / 4
-        # Energy counter (daily reset) for panel 1
-        en_pan2 = int('0x' + data[78:84], 0) * (8.311 / 3600)
-        en_pan1 = int('0x' + data[88:94], 0) * (8.311 / 3600)
-        return {
+        df_ts = int('0x'+ data[38:42], 0)
+        # Energy counter (daily reset) for panel 1 ff => order according to kadsol et. al.
+        en_pan1 = int('0x' + data[78:84], 0) * (8.311 / 3600)
+        en_pan2 = int('0x' + data[88:94], 0) * (8.311 / 3600)
+        en_pan3 = int('0x' + data[98:104], 0) * (8.311 / 3600)
+        en_pan4 = int('0x' + data[108:114], 0) * (8.311 / 3600)
+        if panels == 4: return { # order according to kadsol et. al.
             'temperature': round(invtemp, 2),
             'freq_ac': round(freq_ac, 2),
-            'current_dc1': round(currdc1, 2),
-            'current_dc2': round(currdc2, 2),
+            'current_dc1': round(currdc1, 4),
+            'current_dc2': round(currdc2, 4),
+            'current_dc3': round(currdc3, 4),
+            'current_dc4': round(currdc4, 4),
             'voltage_dc1': round(voltdc1, 2),
             'voltage_dc2': round(voltdc2, 2),
+            'voltage_dc3': round(voltdc3, 2),
+            'voltage_dc4': round(voltdc4, 2),
             'voltage_ac': round(volt_ac, 2),
-            'energy_panel1': round(en_pan1, 3),
-            'energy_panel2': round(en_pan2, 3),
+            'energy_panel1': round(en_pan1, 4),
+            'energy_panel2': round(en_pan2, 4),
+            'energy_panel3': round(en_pan3, 4),
+            'energy_panel4': round(en_pan4, 4),
+#            'dataframe_timestamp': df_ts,
             'watt_panel1': round(currdc1 * voltdc1, 2),
-            'watt_panel2': round(currdc2 * voltdc2, 2)}
+            'watt_panel2': round(currdc2 * voltdc2, 2),
+            'watt_panel3': round(currdc3 * voltdc3, 2),
+            'watt_panel4': round(currdc4 * voltdc4, 2)}
+        else: return { # order swapped to maintain consistency to No13 & historic data
+            'temperature': round(invtemp, 2),
+            'freq_ac': round(freq_ac, 2),
+            'current_dc1': round(currdc2, 4),
+            'current_dc2': round(currdc1, 4),
+            'voltage_dc1': round(voltdc2, 2),
+            'voltage_dc2': round(voltdc1, 2),
+            'voltage_ac': round(volt_ac, 2),
+            'energy_panel1': round(en_pan2, 4),
+            'energy_panel2': round(en_pan1, 4),
+#            'dataframe_timestamp': df_ts,
+            'watt_panel1': round(currdc2 * voltdc2, 2),
+            'watt_panel2': round(currdc1 * voltdc1, 2)}
 
-    def __parse(self, in_str):
+    def __parse(self, in_str, panels):
         '''
         Parse incoming messages
             Split multiple messages, decode them and return the output
@@ -252,7 +284,7 @@ class ApsYc600:
                 raise Exception('Data corrupt, length field does not match actual length')
             cmd = in_str[:(10 + str_len * 2)] # Copy command to str
             in_str = in_str[10 + (str_len * 2):]
-            decoded_cmd.append(self.__decode(cmd))
+            decoded_cmd.append(self.__decode(cmd, panels))
         return decoded_cmd
 
     # Public functions
@@ -284,6 +316,7 @@ class ApsYc600:
         '''
         Get values from inverter
         '''
+        panels=self.inv_data[inverter_index]['panels']
         self.clear_buffer()
         if inverter_index > len(self.inv_data) -1:
             raise Exception('Invalid inverter')
@@ -295,7 +328,8 @@ class ApsYc600:
         time.sleep(1)
         # Check poll response
         return_str = self.__listen()
-        response_data = self.__parse(return_str)
+        response_data = self.__parse(return_str, panels)
+#        print(response_data) 
         # Check if correct response is found...
         for response in response_data:
             if response['cmd'] == '4480' and 'CD' in response['data']:
@@ -311,14 +345,14 @@ class ApsYc600:
         self.__send_cmd('2101')
         str_resp = self.__listen()
         if str_resp is None:
-            print("Ping reply empty")
+            print(str(datetime.datetime.now().replace(microsecond=0)) + ' Ping reply empty')
             return False
-        cmd_output = self.__parse(str_resp)
+        cmd_output = self.__parse(str_resp, 0)
 
         for cmd in cmd_output:
             if cmd['cmd'] == 'ZigbeePingResp' and cmd['crc'] and cmd['data'] == '7907':
                 return True
-        print("Ping failed", cmd_output)
+        print(str(datetime.datetime.now().replace(microsecond=0)) + ' Ping failed', cmd_output)
         return False
 
     def start_coordinator(self, pair_mode=False):
@@ -365,7 +399,7 @@ class ApsYc600:
             try:
                 if not expect_response[cmd_index][0] in result_str:
                     all_verified = False
-                    print('Verify failed', cmd, result_str)
+                    print(str(datetime.datetime.now().replace(microsecond=0)) + ' Verify failed', cmd, result_str)
             finally:
                 pass
             # Final commands need more time to process
@@ -380,7 +414,7 @@ class ApsYc600:
         '''
         self.clear_buffer()
         self.__send_cmd('2700')
-        print('check_coord', self.__listen(500))
+        print(str(datetime.datetime.now().replace(microsecond=0)) + ' check_coord', self.__listen(500))
 
     def clear_buffer(self):
         '''
@@ -418,6 +452,7 @@ class ApsYc600:
         for cmd in init_cmd:
             self.__send_cmd(cmd)
             result_str = self.__listen(1100)
+            #GES uncomment til pass
             #cmd_index = init_cmd.index(cmd)
             #try:
             #    if not expect_response[cmd_index][0] in result_str:
@@ -426,7 +461,8 @@ class ApsYc600:
             #finally:
             #    pass
             time.sleep(1.5)
-            result = self.__parse(result_str)
+            result = self.__parse(result_str, 0)
+#            print(result) 
 
             for result_obj in result:
                 if inverter_serial in result_obj['data']:
@@ -437,7 +473,8 @@ class ApsYc600:
                             self.__reverse_byte_str(self.controller_id)[-4:]):
 
                         found = inv_id[2:]+inv_id[:2]
-                        print('Inverter ID Found', found)
+                        print(str(datetime.datetime.now().replace(microsecond=0)) + ' Inverter ID Found', found)
                         return found
 
         return found
+
